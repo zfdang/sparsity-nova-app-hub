@@ -1,0 +1,540 @@
+# Nova App Hub - Build on Merge Workflow
+# Stage 1: Build Docker image and trigger AWS CodeBuild for EIF generation
+
+name: Build and Publish
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/**'
+
+env:
+  # AWS Configuration (update these values)
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: 123456789012.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPOSITORY_PREFIX: nova-apps
+  S3_BUCKET: nova-app-hub-artifacts
+  CODEBUILD_PROJECT: nova-app-hub-eif-builder
+
+jobs:
+  detect-changes:
+    name: Detect Changed Apps
+    runs-on: ubuntu-latest
+    outputs:
+      apps: ${{ steps.detect.outputs.apps }}
+      has_changes: ${{ steps.detect.outputs.has_changes }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      
+      - name: Detect changed apps
+        id: detect
+        run: |
+          # Get changed files in this push
+          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD -- 'apps/')
+          
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+          
+          # Extract unique app directories (exclude _example)
+          APPS=()
+          for file in $CHANGED_FILES; do
+            if [[ "$file" =~ ^apps/([^/]+)/nova-build\.yaml$ ]]; then
+              APP_NAME="${BASH_REMATCH[1]}"
+              # Skip example directory
+              if [ "$APP_NAME" != "_example" ]; then
+                if [[ ! " ${APPS[@]} " =~ " ${APP_NAME} " ]]; then
+                  APPS+=("$APP_NAME")
+                fi
+              fi
+            fi
+          done
+          
+          if [ ${#APPS[@]} -eq 0 ]; then
+            echo "No app changes detected"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "apps=[]" >> $GITHUB_OUTPUT
+          else
+            echo "Apps to build: ${APPS[*]}"
+            JSON_APPS=$(printf '%s\n' "${APPS[@]}" | jq -R . | jq -s -c .)
+            echo "apps=$JSON_APPS" >> $GITHUB_OUTPUT
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+  build-docker:
+    name: Build Docker - ${{ matrix.app }}
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJson(needs.detect-changes.outputs.apps) }}
+    
+    outputs:
+      image_uri: ${{ steps.build.outputs.image_uri }}
+      image_digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+      
+      - name: Parse build configuration
+        id: config
+        run: |
+          CONFIG_FILE="apps/${{ matrix.app }}/nova-build.yaml"
+          
+          echo "Parsing configuration from: $CONFIG_FILE"
+          
+          # Extract configuration values
+          NAME=$(yq eval '.name' "$CONFIG_FILE")
+          VERSION=$(yq eval '.version' "$CONFIG_FILE")
+          REPO=$(yq eval '.repo' "$CONFIG_FILE")
+          BRANCH=$(yq eval '.branch' "$CONFIG_FILE")
+          COMMIT=$(yq eval '.commit // ""' "$CONFIG_FILE")
+          DIRECTORY=$(yq eval '.build.directory // "."' "$CONFIG_FILE")
+          DOCKERFILE=$(yq eval '.build.dockerfile // "Dockerfile"' "$CONFIG_FILE")
+          
+          # Enclave configuration (build-time only)
+          DEBUG_MODE=$(yq eval '.enclave.debug_mode // false' "$CONFIG_FILE")
+          
+          # Reproducible build settings
+          REPRODUCIBLE_ENABLED=$(yq eval '.reproducible.enabled // true' "$CONFIG_FILE")
+          SOURCE_DATE_EPOCH=$(yq eval '.reproducible.source_date_epoch // ""' "$CONFIG_FILE")
+          
+          # Metadata
+          DESCRIPTION=$(yq eval '.metadata.description // ""' "$CONFIG_FILE")
+          MAINTAINER=$(yq eval '.metadata.maintainer // ""' "$CONFIG_FILE")
+          LICENSE=$(yq eval '.metadata.license // ""' "$CONFIG_FILE")
+          
+          # Parse build args
+          BUILD_ARGS=""
+          ARGS_COUNT=$(yq eval '.build.args | length' "$CONFIG_FILE")
+          if [ "$ARGS_COUNT" != "0" ] && [ "$ARGS_COUNT" != "null" ]; then
+            for i in $(seq 0 $((ARGS_COUNT - 1))); do
+              ARG_NAME=$(yq eval ".build.args[$i].name" "$CONFIG_FILE")
+              ARG_VALUE=$(yq eval ".build.args[$i].value" "$CONFIG_FILE")
+              BUILD_ARGS="${BUILD_ARGS}${ARG_NAME}=${ARG_VALUE},"
+            done
+          fi
+          
+          # Set outputs
+          echo "name=$NAME" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "repo=$REPO" >> $GITHUB_OUTPUT
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+          echo "directory=$DIRECTORY" >> $GITHUB_OUTPUT
+          echo "dockerfile=$DOCKERFILE" >> $GITHUB_OUTPUT
+          echo "debug_mode=$DEBUG_MODE" >> $GITHUB_OUTPUT
+          echo "reproducible_enabled=$REPRODUCIBLE_ENABLED" >> $GITHUB_OUTPUT
+          echo "source_date_epoch=$SOURCE_DATE_EPOCH" >> $GITHUB_OUTPUT
+          echo "build_args=$BUILD_ARGS" >> $GITHUB_OUTPUT
+          echo "description=$DESCRIPTION" >> $GITHUB_OUTPUT
+          echo "maintainer=$MAINTAINER" >> $GITHUB_OUTPUT
+          echo "license=$LICENSE" >> $GITHUB_OUTPUT
+      
+      - name: Clone source repository
+        id: clone
+        run: |
+          echo "Cloning repository: ${{ steps.config.outputs.repo }}"
+          
+          CLONE_DIR="source-repo"
+          git clone --branch ${{ steps.config.outputs.branch }} ${{ steps.config.outputs.repo }} "$CLONE_DIR"
+          
+          cd "$CLONE_DIR"
+          
+          # Checkout specific commit if specified
+          if [ -n "${{ steps.config.outputs.commit }}" ]; then
+            git checkout ${{ steps.config.outputs.commit }}
+          fi
+          
+          # Get commit info
+          COMMIT_SHA=$(git rev-parse HEAD)
+          COMMIT_SHORT=$(git rev-parse --short HEAD)
+          COMMIT_TIMESTAMP=$(git log -1 --pretty=%ct)
+          COMMIT_MESSAGE=$(git log -1 --pretty=%B | head -1)
+          COMMIT_AUTHOR=$(git log -1 --pretty=%an)
+          COMMIT_DATE=$(git log -1 --pretty=%ci)
+          
+          echo "commit_sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
+          echo "commit_short=$COMMIT_SHORT" >> $GITHUB_OUTPUT
+          echo "commit_timestamp=$COMMIT_TIMESTAMP" >> $GITHUB_OUTPUT
+          echo "commit_message=$COMMIT_MESSAGE" >> $GITHUB_OUTPUT
+          echo "commit_author=$COMMIT_AUTHOR" >> $GITHUB_OUTPUT
+          echo "commit_date=$COMMIT_DATE" >> $GITHUB_OUTPUT
+          
+          # Verify Dockerfile exists
+          DOCKERFILE_PATH="${{ steps.config.outputs.directory }}/${{ steps.config.outputs.dockerfile }}"
+          if [ ! -f "$DOCKERFILE_PATH" ]; then
+            echo "ERROR: Dockerfile not found at $DOCKERFILE_PATH"
+            exit 1
+          fi
+          
+          echo "✅ Source repository cloned successfully"
+          echo "   Commit: $COMMIT_SHA"
+          echo "   Timestamp: $COMMIT_TIMESTAMP"
+      
+      - name: Determine SOURCE_DATE_EPOCH
+        id: epoch
+        run: |
+          # Use configured epoch, or fall back to commit timestamp
+          if [ -n "${{ steps.config.outputs.source_date_epoch }}" ]; then
+            EPOCH="${{ steps.config.outputs.source_date_epoch }}"
+            echo "Using configured SOURCE_DATE_EPOCH: $EPOCH"
+          else
+            EPOCH="${{ steps.clone.outputs.commit_timestamp }}"
+            echo "Using commit timestamp as SOURCE_DATE_EPOCH: $EPOCH"
+          fi
+          echo "epoch=$EPOCH" >> $GITHUB_OUTPUT
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      - name: Create ECR repository if not exists
+        run: |
+          REPO_NAME="${{ env.ECR_REPOSITORY_PREFIX }}/${{ steps.config.outputs.name }}"
+          
+          aws ecr describe-repositories --repository-names "$REPO_NAME" 2>/dev/null || \
+            aws ecr create-repository --repository-name "$REPO_NAME" --image-scanning-configuration scanOnPush=true
+      
+      - name: Build and push Docker image (Reproducible)
+        id: build
+        run: |
+          NAME="${{ steps.config.outputs.name }}"
+          VERSION="${{ steps.config.outputs.version }}"
+          COMMIT_SHORT="${{ steps.clone.outputs.commit_short }}"
+          DIRECTORY="${{ steps.config.outputs.directory }}"
+          DOCKERFILE="${{ steps.config.outputs.dockerfile }}"
+          SOURCE_DATE_EPOCH="${{ steps.epoch.outputs.epoch }}"
+          
+          # Full image name
+          ECR_IMAGE="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY_PREFIX }}/${NAME}"
+          IMAGE_TAG="${VERSION}-${COMMIT_SHORT}"
+          
+          # Build context path
+          BUILD_CONTEXT="source-repo/${DIRECTORY}"
+          DOCKERFILE_PATH="source-repo/${DIRECTORY}/${DOCKERFILE}"
+          
+          # Prepare build args for reproducibility
+          BUILD_ARGS_FLAGS="--build-arg SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
+          
+          # Add user-defined build args
+          USER_ARGS="${{ steps.config.outputs.build_args }}"
+          if [ -n "$USER_ARGS" ]; then
+            IFS=',' read -ra ARG_ARRAY <<< "$USER_ARGS"
+            for arg in "${ARG_ARRAY[@]}"; do
+              if [ -n "$arg" ]; then
+                BUILD_ARGS_FLAGS="$BUILD_ARGS_FLAGS --build-arg $arg"
+              fi
+            done
+          fi
+          
+          # Labels for traceability
+          LABELS="--label org.opencontainers.image.source=${{ steps.config.outputs.repo }}"
+          LABELS="$LABELS --label org.opencontainers.image.revision=${{ steps.clone.outputs.commit_sha }}"
+          LABELS="$LABELS --label org.opencontainers.image.version=${VERSION}"
+          LABELS="$LABELS --label org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          LABELS="$LABELS --label org.opencontainers.image.title=${NAME}"
+          LABELS="$LABELS --label io.nova.source_date_epoch=${SOURCE_DATE_EPOCH}"
+          LABELS="$LABELS --label io.nova.reproducible=true"
+          
+          echo "Building Docker image with reproducible settings..."
+          echo "  SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH"
+          echo "  Context: $BUILD_CONTEXT"
+          echo "  Dockerfile: $DOCKERFILE_PATH"
+          
+          # Build with reproducibility flags
+          docker buildx build \
+            --platform linux/amd64 \
+            --file "$DOCKERFILE_PATH" \
+            --tag "${ECR_IMAGE}:${IMAGE_TAG}" \
+            --tag "${ECR_IMAGE}:${VERSION}" \
+            --tag "${ECR_IMAGE}:${COMMIT_SHORT}" \
+            $LABELS \
+            $BUILD_ARGS_FLAGS \
+            --provenance=false \
+            --sbom=false \
+            --push \
+            "$BUILD_CONTEXT"
+          
+          # Get image digest
+          DIGEST=$(docker buildx imagetools inspect "${ECR_IMAGE}:${IMAGE_TAG}" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          
+          echo "image_uri=${ECR_IMAGE}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          echo "image=${ECR_IMAGE}" >> $GITHUB_OUTPUT
+          
+          echo "✅ Docker image built and pushed successfully"
+          echo "   Image: ${ECR_IMAGE}:${IMAGE_TAG}"
+          echo "   Digest: $DIGEST"
+      
+      - name: Prepare build metadata for CodeBuild
+        id: metadata
+        run: |
+          # Create metadata file for CodeBuild
+          cat > build-metadata.json << EOF
+          {
+            "app_name": "${{ steps.config.outputs.name }}",
+            "version": "${{ steps.config.outputs.version }}",
+            "image_uri": "${{ steps.build.outputs.image_uri }}",
+            "image_digest": "${{ steps.build.outputs.digest }}",
+            "source_repo": "${{ steps.config.outputs.repo }}",
+            "source_branch": "${{ steps.config.outputs.branch }}",
+            "source_commit": "${{ steps.clone.outputs.commit_sha }}",
+            "source_commit_short": "${{ steps.clone.outputs.commit_short }}",
+            "source_date_epoch": "${{ steps.epoch.outputs.epoch }}",
+            "debug_mode": ${{ steps.config.outputs.debug_mode }},
+            "github_run_id": "${{ github.run_id }}",
+            "github_run_number": "${{ github.run_number }}",
+            "build_timestamp": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          }
+          EOF
+          
+          cat build-metadata.json
+          
+          # Upload to S3
+          aws s3 cp build-metadata.json "s3://${{ env.S3_BUCKET }}/builds/${{ steps.config.outputs.name }}/${{ steps.config.outputs.version }}/build-metadata.json"
+          
+          echo "s3_metadata_path=s3://${{ env.S3_BUCKET }}/builds/${{ steps.config.outputs.name }}/${{ steps.config.outputs.version }}/build-metadata.json" >> $GITHUB_OUTPUT
+      
+      - name: Trigger AWS CodeBuild for EIF generation
+        id: codebuild
+        run: |
+          echo "Triggering AWS CodeBuild for EIF generation..."
+          
+          # Start CodeBuild project
+          BUILD_ID=$(aws codebuild start-build \
+            --project-name "${{ env.CODEBUILD_PROJECT }}" \
+            --environment-variables-override \
+              "name=APP_NAME,value=${{ steps.config.outputs.name }},type=PLAINTEXT" \
+              "name=APP_VERSION,value=${{ steps.config.outputs.version }},type=PLAINTEXT" \
+              "name=IMAGE_URI,value=${{ steps.build.outputs.image_uri }},type=PLAINTEXT" \
+              "name=DEBUG_MODE,value=${{ steps.config.outputs.debug_mode }},type=PLAINTEXT" \
+              "name=S3_BUCKET,value=${{ env.S3_BUCKET }},type=PLAINTEXT" \
+              "name=SOURCE_COMMIT,value=${{ steps.clone.outputs.commit_sha }},type=PLAINTEXT" \
+              "name=SOURCE_COMMIT_SHORT,value=${{ steps.clone.outputs.commit_short }},type=PLAINTEXT" \
+              "name=GITHUB_RUN_ID,value=${{ github.run_id }},type=PLAINTEXT" \
+            --query 'build.id' --output text)
+          
+          echo "CodeBuild started: $BUILD_ID"
+          echo "build_id=$BUILD_ID" >> $GITHUB_OUTPUT
+          
+          # Wait for CodeBuild to complete
+          echo "Waiting for CodeBuild to complete..."
+          aws codebuild batch-get-builds --ids "$BUILD_ID" --query 'builds[0].buildStatus' --output text
+          
+          while true; do
+            STATUS=$(aws codebuild batch-get-builds --ids "$BUILD_ID" --query 'builds[0].buildStatus' --output text)
+            echo "Current status: $STATUS"
+            
+            if [ "$STATUS" = "SUCCEEDED" ]; then
+              echo "✅ CodeBuild completed successfully"
+              break
+            elif [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "FAULT" ] || [ "$STATUS" = "STOPPED" ] || [ "$STATUS" = "TIMED_OUT" ]; then
+              echo "❌ CodeBuild failed with status: $STATUS"
+              # Get build logs URL
+              LOGS_URL=$(aws codebuild batch-get-builds --ids "$BUILD_ID" --query 'builds[0].logs.deepLink' --output text)
+              echo "Logs: $LOGS_URL"
+              exit 1
+            fi
+            
+            sleep 30
+          done
+      
+      - name: Download EIF artifacts from S3
+        id: download
+        run: |
+          APP_NAME="${{ steps.config.outputs.name }}"
+          VERSION="${{ steps.config.outputs.version }}"
+          
+          mkdir -p artifacts
+          
+          # Download EIF and PCR files
+          aws s3 cp "s3://${{ env.S3_BUCKET }}/builds/${APP_NAME}/${VERSION}/${APP_NAME}.eif" artifacts/
+          aws s3 cp "s3://${{ env.S3_BUCKET }}/builds/${APP_NAME}/${VERSION}/pcr.json" artifacts/
+          aws s3 cp "s3://${{ env.S3_BUCKET }}/builds/${APP_NAME}/${VERSION}/build-info.json" artifacts/
+          
+          # Display PCR values
+          echo "=========================================="
+          echo "PCR Values:"
+          echo "=========================================="
+          cat artifacts/pcr.json
+          
+          # Extract PCR values for release notes
+          PCR0=$(jq -r '.PCR0' artifacts/pcr.json)
+          PCR1=$(jq -r '.PCR1' artifacts/pcr.json)
+          PCR2=$(jq -r '.PCR2' artifacts/pcr.json)
+          
+          echo "pcr0=$PCR0" >> $GITHUB_OUTPUT
+          echo "pcr1=$PCR1" >> $GITHUB_OUTPUT
+          echo "pcr2=$PCR2" >> $GITHUB_OUTPUT
+      
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.config.outputs.name }}-v${{ steps.config.outputs.version }}
+          name: "${{ steps.config.outputs.name }} v${{ steps.config.outputs.version }}"
+          body: |
+            ## AWS Nitro Enclave Build
+            
+            - **Application**: ${{ steps.config.outputs.name }}
+            - **Version**: ${{ steps.config.outputs.version }}
+            - **Build Time**: ${{ github.event.head_commit.timestamp }}
+            - **Build Number**: ${{ github.run_number }}
+            
+            ## Source
+            
+            - **Repository**: ${{ steps.config.outputs.repo }}
+            - **Branch**: ${{ steps.config.outputs.branch }}
+            - **Commit**: `${{ steps.clone.outputs.commit_sha }}`
+            - **Commit Message**: ${{ steps.clone.outputs.commit_message }}
+            - **SOURCE_DATE_EPOCH**: `${{ steps.epoch.outputs.epoch }}`
+            
+            ## Build Settings
+            
+            | Setting | Value |
+            |---------|-------|
+            | Debug Mode | ${{ steps.config.outputs.debug_mode }} |
+            
+            ## PCR Values (Platform Configuration Registers)
+            
+            These values can be used for remote attestation to verify the enclave identity.
+            
+            | PCR | Value |
+            |-----|-------|
+            | **PCR0** | `${{ steps.download.outputs.pcr0 }}` |
+            | **PCR1** | `${{ steps.download.outputs.pcr1 }}` |
+            | **PCR2** | `${{ steps.download.outputs.pcr2 }}` |
+            
+            ## Docker Image
+            
+            ```
+            ${{ steps.build.outputs.image_uri }}
+            ```
+            
+            **Digest**: `${{ steps.build.outputs.digest }}`
+            
+            ## EIF File
+            
+            The EIF file is available:
+            - As a release attachment below
+            - In S3: `s3://${{ env.S3_BUCKET }}/builds/${{ steps.config.outputs.name }}/${{ steps.config.outputs.version }}/${{ steps.config.outputs.name }}.eif`
+            
+            ## Verification
+            
+            To verify this build:
+            
+            1. Check the [GitHub Actions run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            2. Verify PCR values match the expected values for your attestation policy
+            3. The build is reproducible - rebuilding from the same commit with the same SOURCE_DATE_EPOCH should produce identical PCR values
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/${{ steps.config.outputs.name }}.eif
+            artifacts/pcr.json
+            artifacts/build-info.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Update build info
+        run: |
+          APP_NAME="${{ steps.config.outputs.name }}"
+          VERSION="${{ steps.config.outputs.version }}"
+          BUILD_INFO_FILE="apps/${{ matrix.app }}/BUILD_INFO.md"
+          
+          cat > "$BUILD_INFO_FILE" << EOF
+          # Build Information
+          
+          > This file is auto-generated. Do not edit manually.
+          
+          ## Latest Build
+          
+          | Property | Value |
+          |----------|-------|
+          | **Version** | ${VERSION} |
+          | **Build Time** | $(date -u +'%Y-%m-%dT%H:%M:%SZ') |
+          | **Build Number** | ${{ github.run_number }} |
+          | **Source Commit** | \`${{ steps.clone.outputs.commit_short }}\` |
+          | **SOURCE_DATE_EPOCH** | \`${{ steps.epoch.outputs.epoch }}\` |
+          
+          ## PCR Values
+          
+          | PCR | Value |
+          |-----|-------|
+          | **PCR0** | \`${{ steps.download.outputs.pcr0 }}\` |
+          | **PCR1** | \`${{ steps.download.outputs.pcr1 }}\` |
+          | **PCR2** | \`${{ steps.download.outputs.pcr2 }}\` |
+          
+          ## Docker Image
+          
+          \`\`\`
+          ${{ steps.build.outputs.image_uri }}
+          \`\`\`
+          
+          **Digest**: \`${{ steps.build.outputs.digest }}\`
+          
+          ## EIF File
+          
+          - **S3**: \`s3://${{ env.S3_BUCKET }}/builds/${APP_NAME}/${VERSION}/${APP_NAME}.eif\`
+          - **GitHub Release**: [${APP_NAME}-v${VERSION}](https://github.com/${{ github.repository }}/releases/tag/${APP_NAME}-v${VERSION})
+          
+          ## Verification
+          
+          To verify this build, check the [GitHub Actions run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+          EOF
+          
+          echo "✅ Build info updated"
+      
+      - name: Commit build info
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update build info for ${{ steps.config.outputs.name }} v${{ steps.config.outputs.version }}"
+          file_pattern: "apps/${{ matrix.app }}/BUILD_INFO.md"
+      
+      - name: Summary
+        run: |
+          echo "## Build Summary for ${{ steps.config.outputs.name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **Build Successful!**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Application Info" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Name | ${{ steps.config.outputs.name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | ${{ steps.config.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Source Commit | \`${{ steps.clone.outputs.commit_short }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| SOURCE_DATE_EPOCH | \`${{ steps.epoch.outputs.epoch }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### PCR Values" >> $GITHUB_STEP_SUMMARY
+          echo "| PCR | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| PCR0 | \`${{ steps.download.outputs.pcr0 }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| PCR1 | \`${{ steps.download.outputs.pcr1 }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| PCR2 | \`${{ steps.download.outputs.pcr2 }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "| Type | Location |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Docker Image | \`${{ steps.build.outputs.image_uri }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| EIF File | S3 + GitHub Release |" >> $GITHUB_STEP_SUMMARY

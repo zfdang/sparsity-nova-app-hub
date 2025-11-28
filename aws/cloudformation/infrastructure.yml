@@ -1,0 +1,353 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Nova App Hub - AWS Infrastructure for Nitro Enclave EIF Building'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: nova-app-hub
+    Description: Project name prefix for all resources
+  
+  ECRRepositoryPrefix:
+    Type: String
+    Default: nova-apps
+    Description: Prefix for ECR repositories
+  
+  GitHubOrg:
+    Type: String
+    Default: sparsity-xyz
+    Description: GitHub organization name
+  
+  GitHubRepo:
+    Type: String
+    Default: sparsity-nova-app-hub
+    Description: GitHub repository name
+
+Resources:
+  #############################################
+  # S3 Bucket for Build Artifacts
+  #############################################
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-artifacts-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldBuilds
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  #############################################
+  # ECR Repository for Docker Images
+  #############################################
+  # Note: Individual app repositories are created dynamically by the workflow
+  # This is a base repository for shared images if needed
+  
+  #############################################
+  # IAM Role for CodeBuild
+  #############################################
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-codebuild-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CloudWatch Logs
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-*:*'
+              
+              # S3 Access
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ArtifactsBucket.Arn
+                  - !Sub '${ArtifactsBucket.Arn}/*'
+              
+              # ECR Access
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeRepositories
+                  - ecr:CreateRepository
+                  - ecr:SetRepositoryPolicy
+                Resource:
+                  - !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ECRRepositoryPrefix}/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  #############################################
+  # IAM User for GitHub Actions
+  #############################################
+  GitHubActionsUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub '${ProjectName}-github-actions'
+      Policies:
+        - PolicyName: GitHubActionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # ECR Access
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeRepositories
+                  - ecr:CreateRepository
+                  - ecr:SetRepositoryPolicy
+                  - ecr:PutImageScanningConfiguration
+                Resource:
+                  - !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ECRRepositoryPrefix}/*'
+              
+              # S3 Access
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ArtifactsBucket.Arn
+                  - !Sub '${ArtifactsBucket.Arn}/*'
+              
+              # CodeBuild Access
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - codebuild:ListBuildsForProject
+                Resource:
+                  - !GetAtt EIFBuilderProject.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  GitHubActionsAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref GitHubActionsUser
+
+  #############################################
+  # CodeBuild Project for EIF Generation
+  #############################################
+  EIFBuilderProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-eif-builder'
+      Description: 'Builds AWS Nitro Enclave EIF files from Docker images'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: S3_BUCKET
+            Value: !Ref ArtifactsBucket
+      Source:
+        Type: S3
+        Location: !Sub '${ArtifactsBucket}/codebuild-source/buildspec.yml'
+        BuildSpec: |
+          version: 0.2
+          
+          env:
+            variables:
+              APP_NAME: "example-app"
+              APP_VERSION: "1.0.0"
+              IMAGE_URI: ""
+              DEBUG_MODE: "false"
+              SOURCE_COMMIT: ""
+              SOURCE_COMMIT_SHORT: ""
+              GITHUB_RUN_ID: ""
+          
+          phases:
+            install:
+              runtime-versions:
+                docker: 20
+              commands:
+                - echo "Installing AWS Nitro CLI..."
+                - amazon-linux-extras install aws-nitro-enclaves-cli -y || yum install aws-nitro-enclaves-cli -y
+                - yum install aws-nitro-enclaves-cli-devel jq -y
+                - nitro-cli --version || echo "Note: nitro-cli requires Nitro Enclave-enabled instance"
+            
+            pre_build:
+              commands:
+                - echo "Logging in to Amazon ECR..."
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $(echo $IMAGE_URI | cut -d'/' -f1)
+                - echo "Pulling Docker image..."
+                - docker pull $IMAGE_URI
+            
+            build:
+              commands:
+                - echo "Building Nitro Enclave EIF..."
+                - mkdir -p output
+                - |
+                  if [ "$DEBUG_MODE" = "true" ]; then
+                    nitro-cli build-enclave --docker-uri $IMAGE_URI --output-file output/${APP_NAME}.eif --debug-mode 2>&1 | tee output/build-output.txt
+                  else
+                    nitro-cli build-enclave --docker-uri $IMAGE_URI --output-file output/${APP_NAME}.eif 2>&1 | tee output/build-output.txt
+                  fi
+                - |
+                  # Extract PCR values
+                  PCR0=$(grep -oP '"PCR0":\s*"\K[^"]+' output/build-output.txt || echo "")
+                  PCR1=$(grep -oP '"PCR1":\s*"\K[^"]+' output/build-output.txt || echo "")
+                  PCR2=$(grep -oP '"PCR2":\s*"\K[^"]+' output/build-output.txt || echo "")
+                  
+                  cat > output/pcr.json << EOF
+                  {
+                    "PCR0": "$PCR0",
+                    "PCR1": "$PCR1",
+                    "PCR2": "$PCR2"
+                  }
+                  EOF
+                - |
+                  cat > output/build-info.json << EOF
+                  {
+                    "app_name": "$APP_NAME",
+                    "version": "$APP_VERSION",
+                    "image_uri": "$IMAGE_URI",
+                    "source_commit": "$SOURCE_COMMIT",
+                    "debug_mode": $DEBUG_MODE,
+                    "github_run_id": "$GITHUB_RUN_ID",
+                    "build_timestamp": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+                  }
+                  EOF
+            
+            post_build:
+              commands:
+                - echo "Uploading artifacts to S3..."
+                - aws s3 cp output/${APP_NAME}.eif s3://${S3_BUCKET}/builds/${APP_NAME}/${APP_VERSION}/${APP_NAME}.eif
+                - aws s3 cp output/pcr.json s3://${S3_BUCKET}/builds/${APP_NAME}/${APP_VERSION}/pcr.json
+                - aws s3 cp output/build-info.json s3://${S3_BUCKET}/builds/${APP_NAME}/${APP_VERSION}/build-info.json
+                - aws s3 cp output/build-output.txt s3://${S3_BUCKET}/builds/${APP_NAME}/${APP_VERSION}/build-output.txt
+                - echo "Build completed!"
+      TimeoutInMinutes: 60
+      QueuedTimeoutInMinutes: 30
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub '/aws/codebuild/${ProjectName}-eif-builder'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  #############################################
+  # CloudWatch Log Group
+  #############################################
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}-eif-builder'
+      RetentionInDays: 30
+
+Outputs:
+  ArtifactsBucketName:
+    Description: S3 bucket for build artifacts
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub '${ProjectName}-artifacts-bucket'
+  
+  ArtifactsBucketArn:
+    Description: S3 bucket ARN
+    Value: !GetAtt ArtifactsBucket.Arn
+  
+  CodeBuildProjectName:
+    Description: CodeBuild project name for EIF building
+    Value: !Ref EIFBuilderProject
+    Export:
+      Name: !Sub '${ProjectName}-codebuild-project'
+  
+  CodeBuildProjectArn:
+    Description: CodeBuild project ARN
+    Value: !GetAtt EIFBuilderProject.Arn
+  
+  GitHubActionsAccessKeyId:
+    Description: Access Key ID for GitHub Actions (store in GitHub Secrets as AWS_ACCESS_KEY_ID)
+    Value: !Ref GitHubActionsAccessKey
+  
+  GitHubActionsSecretAccessKey:
+    Description: Secret Access Key for GitHub Actions (store in GitHub Secrets as AWS_SECRET_ACCESS_KEY)
+    Value: !GetAtt GitHubActionsAccessKey.SecretAccessKey
+  
+  ECRRegistryUrl:
+    Description: ECR Registry URL
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+  
+  ECRRepositoryPrefix:
+    Description: ECR Repository Prefix
+    Value: !Ref ECRRepositoryPrefix
+  
+  AWSRegion:
+    Description: AWS Region
+    Value: !Ref AWS::Region
+
+  # Instructions for setup
+  SetupInstructions:
+    Description: Instructions for completing setup
+    Value: |
+      1. Deploy this CloudFormation stack
+      2. Copy GitHubActionsAccessKeyId and GitHubActionsSecretAccessKey to GitHub Secrets
+      3. Update .github/workflows/build-on-merge.yml with:
+         - AWS_REGION: <AWSRegion output>
+         - ECR_REGISTRY: <ECRRegistryUrl output>
+         - ECR_REPOSITORY_PREFIX: <ECRRepositoryPrefix output>
+         - S3_BUCKET: <ArtifactsBucketName output>
+         - CODEBUILD_PROJECT: <CodeBuildProjectName output>
