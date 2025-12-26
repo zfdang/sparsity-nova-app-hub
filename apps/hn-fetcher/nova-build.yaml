@@ -66,13 +66,13 @@ reproducible:
 # [Optional] Application metadata
 metadata:
   # Brief description (max 500 characters)
-  description: "Example application for Nova App Hub"
+  description: "Hacker News Fetcher for Nova App Hub"
   
   # Maintainer email
-  maintainer: maintainer@example.com
+  maintainer: dantifer@gmail.com
   
   # Project homepage
-  homepage: https://github.com/example/example-app
+  homepage: https://github.com/sparsity-xyz/sparsity-nova-examples
   
   # License identifier
   license: MIT
