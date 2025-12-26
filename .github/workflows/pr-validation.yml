@@ -67,11 +67,16 @@ jobs:
             echo "Validating: $file"
             echo "=========================================="
             
-            # Convert YAML to JSON
-            JSON_CONTENT=$(yq eval -o=json "$file")
+            # Convert YAML to JSON and write to temp file
+            TEMP_JSON=$(mktemp)
+            yq eval -o=json "$file" > "$TEMP_JSON"
             
-            # Validate against schema
-            echo "$JSON_CONTENT" | ajv validate -s "$SCHEMA_FILE" -d /dev/stdin --strict=false
+            # Validate against schema using temp file (stdin doesn't work reliably in GHA)
+            ajv validate -s "$SCHEMA_FILE" -d "$TEMP_JSON" --strict=false
+            
+            # Read JSON content for further processing
+            JSON_CONTENT=$(cat "$TEMP_JSON")
+            rm -f "$TEMP_JSON"
             
             # Extract values
             NAME=$(echo "$JSON_CONTENT" | jq -r '.name')
